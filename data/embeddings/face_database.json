@@ -1,0 +1,12 @@
+{
+  "juan": {
+    "name": "juan",
+    "added_date": "2025-09-17T15:57:46.076180",
+    "embedding_shape": [
+      512
+    ],
+    "num_embeddings": 1,
+    "captures": 10,
+    "registration_method": "interactive_gui"
+  }
+}
