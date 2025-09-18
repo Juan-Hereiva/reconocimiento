@@ -35,6 +35,7 @@ class Config:
     ANTI_SPOOF_DEBUG = True  # NUEVO: habilitar debug por defecto
     ANTI_SPOOF_SMOOTHING = True  # NUEVO: suavizado temporal
     ANTI_SPOOF_SMOOTH_FRAMES = 3  # NUEVO: frames para promediar
+    ANTI_SPOOF_FAIL_TOLERANCE = 4  # NUEVO: frames consecutivos con baja confianza antes de bloquear
     
     # Configuración de cámara
     CAMERA_INDEX = 0
