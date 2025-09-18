@@ -152,7 +152,7 @@ class FaceRecognitionSystem:
             
             # Decisión final de acceso
             is_known_person = person_name is not None
-            is_real_person = is_real_face and spoof_confidence > Config.ANTI_SPOOF_THRESHOLD
+            is_real_person = is_real_face
             
             access_granted = is_known_person and is_real_person and is_alive
             
