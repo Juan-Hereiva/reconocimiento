@@ -1,11 +1,14 @@
 """
 Modelo Anti-Spoofing para detectar ataques con fotos/videos
 """
+
+import os
 import cv2
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from collections import deque
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 import logging
@@ -107,12 +110,15 @@ class AntiSpoofNet(nn.Module):
 
 
 class AntiSpoofDetector:
+
     """Detector anti-spoofing que utiliza la red neuronal"""
+
     
+
     def __init__(self, model_path: Optional[str] = None, device: str = 'auto'):
         """
         Inicializar detector anti-spoofing
-        
+
         Args:
             model_path: Ruta al modelo pre-entrenado
             device: 'cuda', 'cpu' o 'auto'
@@ -121,30 +127,49 @@ class AntiSpoofDetector:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
             self.device = torch.device(device)
-        
+
         # Inicializar modelo
         self.model = AntiSpoofNet().to(self.device)
-        
+        self.model.eval()
+
+        # Estado del modelo
+        self.model_loaded = False
+
         # Cargar modelo pre-entrenado si se proporciona
         if model_path and os.path.exists(model_path):
             try:
                 self.model.load_state_dict(torch.load(model_path, map_location=self.device))
                 self.model.eval()
+                self.model_loaded = True
                 logger.info(f"Modelo anti-spoofing cargado desde {model_path}")
             except Exception as e:
                 logger.error(f"Error cargando modelo: {e}")
         else:
             logger.warning("No se encontró modelo pre-entrenado, usando modelo sin entrenar")
-        
+
         # Transformaciones para preprocesamiento
         self.transform = transforms.Compose([
             transforms.ToPILImage(),
             transforms.Resize((128, 128)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
                      std=[0.229, 0.224, 0.225])
 
         ])
+
+        # Suavizado temporal y tolerancia a falsos negativos
+        smooth_frames = max(1, getattr(Config, 'ANTI_SPOOF_SMOOTH_FRAMES', 1))
+        self.use_smoothing = getattr(Config, 'ANTI_SPOOF_SMOOTHING', False)
+        history_size = smooth_frames if self.use_smoothing else 1
+        self.confidence_history = deque(maxlen=history_size)
+
+        tolerance = getattr(Config, 'ANTI_SPOOF_FAIL_TOLERANCE', smooth_frames)
+        if self.use_smoothing:
+            tolerance = max(2, tolerance)
+        else:
+            tolerance = max(1, tolerance)
+        self.low_confidence_frames = 0
+        self.low_confidence_patience = tolerance
     
     def preprocess_image(self, face_image: np.ndarray) -> torch.Tensor:
         """
@@ -169,55 +194,89 @@ class AntiSpoofDetector:
         except Exception as e:
             logger.error(f"Error en preprocesamiento: {e}")
             return None
-    
+    def _update_confidence(self, confidence: float) -> float:
+        """Actualizar historial de confianza y obtener valor suavizado."""
+        self.confidence_history.append(confidence)
+
+        if self.use_smoothing:
+            return float(np.mean(self.confidence_history))
+        return float(confidence)
+
+    def _apply_low_confidence_logic(self, smoothed_confidence: float) -> Tuple[bool, float]:
+        """Aplicar lógica de tolerancia ante predicciones de baja confianza."""
+        threshold = getattr(Config, 'ANTI_SPOOF_THRESHOLD', 0.5)
+
+        if smoothed_confidence >= threshold:
+            self.low_confidence_frames = 0
+            return True, smoothed_confidence
+
+        self.low_confidence_frames += 1
+        is_real = self.low_confidence_frames < self.low_confidence_patience
+        return is_real, smoothed_confidence
+
     def detect_spoofing(self, face_image: np.ndarray) -> Tuple[bool, float]:
         """
         Detectar si la imagen es un ataque de spoofing
-        
+
         Args:
             face_image: Imagen BGR del rostro
-            
+
         Returns:
             tuple: (is_real, confidence)
         """
         try:
+            if not self.model_loaded:
+                # Si no hay modelo entrenado, no bloquear al usuario
+                return True, 1.0
+
             # Preprocesar imagen
             face_tensor = self.preprocess_image(face_image)
             if face_tensor is None:
-                return False, 0.0
-            
+                smoothed = self._update_confidence(0.0)
+                return self._apply_low_confidence_logic(smoothed)
+
             # Inferencia
             with torch.no_grad():
                 outputs = self.model(face_tensor)
                 probabilities = F.softmax(outputs, dim=1)
-                
+
                 # Asumiendo que índice 0 = fake, índice 1 = real
                 prob_real = probabilities[0, 1].item()
-                is_real = prob_real > Config.ANTI_SPOOF_THRESHOLD
-                
-            return is_real, prob_real
-            
+
+            smoothed = self._update_confidence(prob_real)
+            is_real, final_confidence = self._apply_low_confidence_logic(smoothed)
+
+            # Si la confianza vuelve a subir, reiniciar contador de fallos
+            if prob_real >= getattr(Config, 'ANTI_SPOOF_THRESHOLD', 0.5):
+                self.low_confidence_frames = 0
+
+            return is_real, final_confidence
+
         except Exception as e:
             logger.error(f"Error en detección anti-spoofing: {e}")
-            return False, 0.0
+            smoothed = self._update_confidence(0.0)
+            return self._apply_low_confidence_logic(smoothed)
     
     def batch_detect(self, face_images: list) -> list:
         """
         Detección en lote
-        
+
         Args:
             face_images: Lista de imágenes BGR
-            
+
         Returns:
             list: Lista de tuplas (is_real, confidence)
         """
         results = []
-        
+
         try:
+            if not self.model_loaded:
+                return [(True, 1.0)] * len(face_images)
+
             # Preprocesar todas las imágenes
             batch_tensors = []
             valid_indices = []
-            
+
             for i, face_image in enumerate(face_images):
                 tensor = self.preprocess_image(face_image)
                 if tensor is not None:
@@ -395,30 +454,55 @@ class AntiSpoofTrainer:
             # Guardar métricas
             self.train_losses.append(train_loss)
             self.val_losses.append(val_loss)
+
             self.train_accuracies.append(train_acc)
+
             self.val_accuracies.append(val_acc)
+
             
+
             # Log progreso
+
             logger.info(f'Época {epoch+1}/{num_epochs}:')
+
             logger.info(f'  Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%')
+
             logger.info(f'  Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%')
+
             
+
             # Guardar mejor modelo
+
             if val_acc > best_val_acc:
+
                 best_val_acc = val_acc
+
                 patience_counter = 0
+
                 
+
                 if save_path:
+
                     torch.save(self.model.state_dict(), save_path)
+
                     logger.info(f'Mejor modelo guardado en {save_path}')
+
             else:
+
                 patience_counter += 1
+
             
+
             # Early stopping
+
             if patience_counter >= max_patience:
+
                 logger.info(f'Early stopping en época {epoch+1}')
+
                 break
+
         
+
         return {
             'train_losses': self.train_losses,
             'val_losses': self.val_losses,
@@ -426,5 +510,3 @@ class AntiSpoofTrainer:
             'val_accuracies': self.val_accuracies,
             'best_val_accuracy': best_val_acc
         }
-
-import os  # Agregar import necesario
